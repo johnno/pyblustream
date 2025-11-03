@@ -28,9 +28,10 @@ class Matrix:
         return list(self.inputs_by_name.keys())
 
     async def async_connect(self):
-        await self._protocol.async_connect()
         metadata_json = await self._get_matrix_metadata()
         self._process_meta_data(metadata_json)
+        self._protocol.set_input_count(len(self.inputs_by_id))
+        await self._protocol.async_connect()
 
     def close(self):
         self._protocol.close()
@@ -96,4 +97,4 @@ class Matrix:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 response_text = await response.text()
-                return xmltodict.parse(response_text)                
+                return xmltodict.parse(response_text)

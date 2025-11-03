@@ -11,6 +11,16 @@ from pyblustream.listener import SourceChangeListener
 SUCCESS_CHANGE = re.compile(
     r".*SUCCESS.*output\s*(\d+)\s(connect )?from input\s*(\d+).*"
 )
+# Success message after all outputs have changed:
+# [SUCCESS]Set all output connect from input 03.
+SUCCESS_ALL_CHANGE = re.compile(
+    r".*SUCCESS.*all output\s(connect )?from input\s*(\d+).*"
+)
+# Success message after all outputs have changed to to match the input port number:
+# # [SUCCESS]Set output port to port.
+SUCCESS_PTP = re.compile(
+    r".*SUCCESS.*output port to port.*"
+)
 # Success System powered off:
 # [SUCCESS]Set system power OFF
 # Success system powered on:
@@ -69,7 +79,20 @@ class MatrixProtocol(asyncio.Protocol):
         self._received_message = ""
         self._output_to_input_map = {}
         self._matrix_on = False
+        # Number of inputs on the matrix; discovered later and set via set_input_count
+        self._input_count: int = 0
         self._heartbeat_task = None
+
+    def set_input_count(self, count: int) -> None:
+        """
+        Set the number of inputs known for the matrix.
+        Call this once Matrix has parsed metadata.
+        """
+        try:
+            self._input_count = int(count)
+        except (TypeError, ValueError):
+            # keep previous value if invalid input provided
+            self._logger.warning("Invalid input count provided to set_input_count")
 
     def connect(self):
         connection_task = self._loop.create_connection(
@@ -159,6 +182,25 @@ class MatrixProtocol(asyncio.Protocol):
             output_id = success_change_match.group(1)
             input_id = success_change_match.group(3)
             self._process_input_changed(input_id, output_id)
+            return
+
+        # Message received in response to anyone changing the source on all outputs.
+        success_all_change_match = SUCCESS_ALL_CHANGE.match(message)
+        if success_all_change_match:
+            self._logger.debug(f"Input change on all outputs message received: {message}")
+            input_id = success_all_change_match.group(2)
+            outputs = self._output_to_input_map.keys()
+            for output_id in outputs:
+                self._process_input_changed(input_id, output_id)
+            return
+
+        # Message received in response to anyone changing the source on all outputs to match the input port number.
+        success_ptp_match = SUCCESS_PTP.match(message)
+        if success_ptp_match:
+            self._logger.debug(f"PTP Input change message received: {message}")
+            loop_count = min(self._input_count, len(self._output_to_input_map))
+            for output_id in range(1, loop_count + 1):
+                self._process_input_changed(output_id, output_id)
             return
 
         # Message received in response to anyone changing the power on/off
