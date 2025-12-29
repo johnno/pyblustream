@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from asyncio import Task
 from typing import Any, Optional
 
@@ -84,6 +85,10 @@ class MatrixProtocol(asyncio.Protocol):
         # Number of inputs on the matrix; discovered later and set via set_input_count
         self._input_count: int = 0
         self._heartbeat_task = None
+        # Track last send time to avoid clashes between heartbeat and commands
+        self._last_send_time: float = 0.0
+        # Minimum delay between sends to avoid MCU serial port clashes (in seconds)
+        self._min_send_delay: float = 0.5
 
     def set_input_count(self, count: int) -> None:
         """
@@ -129,6 +134,11 @@ class MatrixProtocol(asyncio.Protocol):
     async def _heartbeat(self):
         while True:
             await asyncio.sleep(self._heartbeat_time)
+            # Skip heartbeat if a command was sent recently to avoid MCU serial port clash
+            time_since_last_send = time.time() - self._last_send_time
+            if time_since_last_send < self._heartbeat_time:
+                self._logger.debug(f"Skipping heartbeat - command sent {time_since_last_send:.2f}s ago")
+                continue
             self._logger.debug("heartbeat")
             self._data_send_persistent("\n")
 
@@ -182,12 +192,20 @@ class MatrixProtocol(asyncio.Protocol):
             self._loop.create_task(self._data_send_ephemeral(message))
 
     async def _data_send_ephemeral(self, message):
+        # Wait if heartbeat was just sent to avoid MCU serial port clash
+        time_since_last_send = time.time() - self._last_send_time
+        if time_since_last_send < self._min_send_delay:
+            wait_time = self._min_send_delay - time_since_last_send
+            self._logger.debug(f"Waiting {wait_time:.2f}s before sending command")
+            await asyncio.sleep(wait_time)
+        
         self._logger.debug(f"data_send_ephemeral client: {message.encode()}")
         try:
             transport, _ = await self._loop.create_connection(
                 lambda: asyncio.Protocol(), host=self._hostname, port=self._port
             )
             transport.write(message.encode())
+            self._last_send_time = time.time()
             transport.close()
         except Exception as e:
             self._logger.error(f"Error in ephemeral connection: {e}")
@@ -195,6 +213,7 @@ class MatrixProtocol(asyncio.Protocol):
     def _data_send_persistent(self, message):
         self._logger.debug(f"data_send client: {message.encode()}")
         self._transport.write(message.encode())
+        self._last_send_time = time.time()
 
     # noinspection DuplicatedCode
     def _process_received_packet(self, message):
