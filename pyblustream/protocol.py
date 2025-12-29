@@ -63,6 +63,7 @@ class MatrixProtocol(asyncio.Protocol):
         callback: SourceChangeListener,
         heartbeat_time=5,
         reconnect_time=10,
+        use_event_connection_for_commands=False,
     ):
         self._logger = logging.getLogger(__name__)
         self._heartbeat_time = heartbeat_time
@@ -71,6 +72,7 @@ class MatrixProtocol(asyncio.Protocol):
         self._port = port
         self._source_change_callback = callback
         self._loop = asyncio.get_event_loop()
+        self._use_event_connection_for_commands = use_event_connection_for_commands
 
         self._connected = False
         self._reconnect = True
@@ -119,13 +121,16 @@ class MatrixProtocol(asyncio.Protocol):
         self._logger.info("Requesting current status")
         self._source_change_callback.connected()
         self.send_status_message()
+        # Cancel any existing heartbeat task before creating a new one
+        if self._heartbeat_task is not None and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
         self._heartbeat_task = self._loop.create_task(self._heartbeat())
 
     async def _heartbeat(self):
         while True:
             await asyncio.sleep(self._heartbeat_time)
             self._logger.debug("heartbeat")
-            self._data_send("\n")
+            self._data_send_persistent("\n")
 
     async def _wait_to_reconnect(self):
         # TODO with the new async_connect I think we can make this much easier - but I can't test right now
@@ -139,7 +144,8 @@ class MatrixProtocol(asyncio.Protocol):
     def connection_lost(self, exc):
         """Method from asyncio.Protocol"""
         self._connected = False
-        self._heartbeat_task.cancel()
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
         disconnected_message = f"Disconnected from {self._hostname}"
         if self._reconnect:
             disconnected_message = (
@@ -170,6 +176,23 @@ class MatrixProtocol(asyncio.Protocol):
                 self._received_message = ""
 
     def _data_send(self, message):
+        if self._use_event_connection_for_commands:
+            self._data_send_persistent(message)
+        else:
+            self._loop.create_task(self._data_send_ephemeral(message))
+
+    async def _data_send_ephemeral(self, message):
+        self._logger.debug(f"data_send_ephemeral client: {message.encode()}")
+        try:
+            transport, _ = await self._loop.create_connection(
+                lambda: asyncio.Protocol(), host=self._hostname, port=self._port
+            )
+            transport.write(message.encode())
+            transport.close()
+        except Exception as e:
+            self._logger.error(f"Error in ephemeral connection: {e}")
+
+    def _data_send_persistent(self, message):
         self._logger.debug(f"data_send client: {message.encode()}")
         self._transport.write(message.encode())
 
@@ -288,8 +311,8 @@ class MatrixProtocol(asyncio.Protocol):
 
     def send_guest_command(self, guest_is_input, guest_id, command):
         prefix = "IN" if guest_is_input else "OUT"
-        open_command = f"{prefix}{guest_id:03}GUEST".encode("ASCII")
-        close_command = "CLOSEACMGUEST".encode("ASCII")
-        rn = "\r\n".encode("ASCII")
+        open_command = f"{prefix}{guest_id:03}GUEST"
+        close_command = "CLOSEACMGUEST"
+        rn = "\r\n"
         full_command = open_command + rn + command + rn + close_command + rn
-        self._transport.write(full_command)
+        self._data_send(full_command)
