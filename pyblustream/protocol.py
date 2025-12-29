@@ -62,7 +62,7 @@ class MatrixProtocol(asyncio.Protocol):
         hostname,
         port,
         callback: SourceChangeListener,
-        heartbeat_time=5,
+        heartbeat_time=60,
         reconnect_time=10,
         use_event_connection_for_commands=False,
     ):
@@ -88,7 +88,7 @@ class MatrixProtocol(asyncio.Protocol):
         # Track last send time to avoid clashes between heartbeat and commands
         self._last_send_time: float = 0.0
         # Minimum delay between sends to avoid MCU serial port clashes (in seconds)
-        self._min_send_delay: float = 0.5
+        self._min_send_delay: float = 1.0
 
     def set_input_count(self, count: int) -> None:
         """
