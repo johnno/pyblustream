@@ -3,7 +3,7 @@ import logging
 import re
 import time
 from asyncio import Task
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from pyblustream.listener import SourceChangeListener
 
@@ -65,6 +65,9 @@ class MatrixProtocol(asyncio.Protocol):
         heartbeat_time=60,
         reconnect_time=10,
         use_event_connection_for_commands=False,
+        wait_for_prompt=True,
+        expected_prompt="Please Input Your Command :",
+        enable_heartbeat=True,
     ):
         self._logger = logging.getLogger(__name__)
         self._heartbeat_time = heartbeat_time
@@ -74,6 +77,9 @@ class MatrixProtocol(asyncio.Protocol):
         self._source_change_callback = callback
         self._loop = asyncio.get_event_loop()
         self._use_event_connection_for_commands = use_event_connection_for_commands
+        self._wait_for_prompt = wait_for_prompt
+        self._expected_prompt = expected_prompt
+        self._enable_heartbeat = enable_heartbeat
 
         self._connected = False
         self._reconnect = True
@@ -85,8 +91,13 @@ class MatrixProtocol(asyncio.Protocol):
         # Number of inputs on the matrix; discovered later and set via set_input_count
         self._input_count: int = 0
         self._heartbeat_task = None
-        # Track last send time to avoid clashes between heartbeat and commands
+        # Command queue to serialize all outgoing commands
+        self._command_queue: asyncio.Queue = asyncio.Queue()
+        self._command_worker_task: Optional[Task[Any]] = None
+        # Track last send time to avoid clashes between commands
         self._last_send_time: float = 0.0
+        # Track last received data time to detect silent/stalled connections
+        self._last_received_time: float = time.time()
         # Minimum delay between sends to avoid MCU serial port clashes (in seconds)
         self._min_send_delay: float = 1.0
 
@@ -125,22 +136,77 @@ class MatrixProtocol(asyncio.Protocol):
         self._logger.info(f"Connection Made: {self.peer_name}")
         self._logger.info("Requesting current status")
         self._source_change_callback.connected()
-        self.send_status_message()
-        # Cancel any existing heartbeat task before creating a new one
+        
+        # Cancel any existing tasks before creating new ones
+        if self._command_worker_task is not None and not self._command_worker_task.done():
+            self._command_worker_task.cancel()
         if self._heartbeat_task is not None and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
-        self._heartbeat_task = self._loop.create_task(self._heartbeat())
+        
+        # Start command worker and heartbeat tasks
+        self._command_worker_task = self._loop.create_task(self._command_worker())
+        if self._enable_heartbeat:
+            self._heartbeat_task = self._loop.create_task(self._heartbeat())
+        
+        self.send_status_message()
+
+    async def _command_worker(self):
+        """Worker task that processes all outgoing commands from the queue."""
+        while True:
+            try:
+                message, use_persistent, response_validator = await self._command_queue.get()
+                try:
+                    # Enforce minimum delay between commands to avoid MCU serial port clashes
+                    time_since_last_send = time.time() - self._last_send_time
+                    if time_since_last_send < self._min_send_delay:
+                        wait_time = self._min_send_delay - time_since_last_send
+                        self._logger.debug(f"Waiting {wait_time:.2f}s before sending command")
+                        await asyncio.sleep(wait_time)
+                    
+                    if use_persistent:
+                        if self._transport and self._connected:
+                            self._logger.debug(f"data_send persistent: {message.encode()}")
+                            self._transport.write(message.encode())
+                        else:
+                            self._logger.warning("Cannot send on persistent connection: not connected")
+                    else:
+                        await self._send_ephemeral_internal(message, response_validator)
+                    
+                    self._last_send_time = time.time()
+                except Exception as e:
+                    self._logger.error(f"Error sending command: {e}")
+                finally:
+                    self._command_queue.task_done()
+            except asyncio.CancelledError:
+                self._logger.debug("Command worker cancelled")
+                break
 
     async def _heartbeat(self):
+        """Send keepalive only when connection has been silent to detect stalled connections."""
         while True:
             await asyncio.sleep(self._heartbeat_time)
-            # Skip heartbeat if a command was sent recently to avoid MCU serial port clash
-            time_since_last_send = time.time() - self._last_send_time
-            if time_since_last_send < self._heartbeat_time:
-                self._logger.debug(f"Skipping heartbeat - command sent {time_since_last_send:.2f}s ago")
-                continue
-            self._logger.debug("heartbeat")
-            self._data_send_persistent("\n")
+            
+            # Only send heartbeat if we haven't heard from the switch recently
+            time_since_last_received = time.time() - self._last_received_time
+            if time_since_last_received >= self._heartbeat_time:
+                # Only send if queue is empty - other commands will keep switch awake
+                if self._command_queue.empty():
+                    self._logger.debug(
+                        f"heartbeat - connection silent for {time_since_last_received:.1f}s, "
+                        "sending OUTSTA query to check connection"
+                    )
+                    # Use OUTSTA command - quick output status check to verify connection
+                    self._data_send_persistent("OUTSTA\r")
+                else:
+                    self._logger.debug(
+                        f"heartbeat - connection silent for {time_since_last_received:.1f}s "
+                        "but queue has pending commands, skipping"
+                    )
+            else:
+                self._logger.debug(
+                    f"heartbeat - received data {time_since_last_received:.1f}s ago, "
+                    "connection is alive, skipping"
+                )
 
     async def _wait_to_reconnect(self):
         # TODO with the new async_connect I think we can make this much easier - but I can't test right now
@@ -156,6 +222,8 @@ class MatrixProtocol(asyncio.Protocol):
         self._connected = False
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
+        if self._command_worker_task is not None:
+            self._command_worker_task.cancel()
         disconnected_message = f"Disconnected from {self._hostname}"
         if self._reconnect:
             disconnected_message = (
@@ -175,6 +243,7 @@ class MatrixProtocol(asyncio.Protocol):
     def data_received(self, data):
         """Method from asyncio.Protocol"""
         self._logger.debug(f"data_received client: {data}")
+        self._last_received_time = time.time()
 
         for letter in data:
             # Don't add these to the message as we don't need them.
@@ -185,35 +254,130 @@ class MatrixProtocol(asyncio.Protocol):
                 self._process_received_packet(self._received_message)
                 self._received_message = ""
 
-    def _data_send(self, message):
-        if self._use_event_connection_for_commands:
-            self._data_send_persistent(message)
-        else:
-            self._loop.create_task(self._data_send_ephemeral(message))
-
-    async def _data_send_ephemeral(self, message):
-        # Wait if heartbeat was just sent to avoid MCU serial port clash
-        time_since_last_send = time.time() - self._last_send_time
-        if time_since_last_send < self._min_send_delay:
-            wait_time = self._min_send_delay - time_since_last_send
-            self._logger.debug(f"Waiting {wait_time:.2f}s before sending command")
-            await asyncio.sleep(wait_time)
+    def _data_send(self, message: str, response_validator: Optional[Callable[[str], bool]] = None):
+        """Queue a command to be sent (either persistent or ephemeral based on config).
         
-        self._logger.debug(f"data_send_ephemeral client: {message.encode()}")
+        Args:
+            message: The message to send
+            response_validator: Optional function that returns True if response is valid
+        """
+        use_persistent = self._use_event_connection_for_commands
         try:
-            transport, _ = await self._loop.create_connection(
-                lambda: asyncio.Protocol(), host=self._hostname, port=self._port
+            self._command_queue.put_nowait((message, use_persistent, response_validator))
+        except asyncio.QueueFull:
+            self._logger.error("Command queue is full, dropping command")
+
+    async def _send_ephemeral_internal(self, message, response_validator: Optional[Callable[[str], bool]] = None):
+        """Send a command via ephemeral connection. Called by command worker only."""
+        self._logger.debug(f"Ephemeral: Opening connection for command: {message.encode()}")
+        
+        try:
+            # Create protocol handler for this connection to receive responses
+            prompt_received = asyncio.Event()
+            response_received = asyncio.Event()
+            response_data = {"matched": False, "messages": [], "command_sent": False}
+            
+            class EphemeralProtocol(asyncio.Protocol):
+                def __init__(self, prompt_received, response_received, response_data, logger, expected_prompt, validator):
+                    self._prompt_received = prompt_received
+                    self._response_received = response_received
+                    self._response_data = response_data
+                    self._logger = logger
+                    self._expected_prompt = expected_prompt
+                    self._validator = validator
+                    self._buffer = ""
+                
+                def data_received(self, data):
+                    self._logger.debug(f"Ephemeral: Received data: {data}")
+                    for letter in data:
+                        if letter != ord("\r") and letter != ord("\n"):
+                            self._buffer += chr(letter)
+                        if letter == ord("\n"):
+                            msg = self._buffer
+                            self._buffer = ""
+                            self._response_data["messages"].append(msg)
+                            self._logger.debug(f"Ephemeral: Parsed message: '{msg}'")
+                            
+                            # Check if this is the expected prompt (before command is sent)
+                            if msg == self._expected_prompt and not self._response_data["command_sent"]:
+                                self._logger.debug(f"Ephemeral: Expected prompt received, ready to send")
+                                self._response_data["matched"] = True
+                                self._prompt_received.set()
+                            # After command is sent, validate response if validator provided
+                            elif self._response_data["command_sent"]:
+                                if self._validator:
+                                    if self._validator(msg):
+                                        self._logger.info(f"Ephemeral: Command succeeded: '{msg}'")
+                                        self._response_data["matched"] = True
+                                        self._response_received.set()
+                                    else:
+                                        self._logger.debug(f"Ephemeral: Unexpected response (not a success): '{msg}'")
+                                else:
+                                    # No validator, can't determine success/failure
+                                    self._logger.debug(f"Ephemeral: Response received (no success validation configured): '{msg}'")
+                                    self._response_received.set()
+            
+            transport, protocol = await self._loop.create_connection(
+                lambda: EphemeralProtocol(prompt_received, response_received, response_data, self._logger, 
+                                         self._expected_prompt, response_validator),
+                host=self._hostname,
+                port=self._port
             )
+            self._logger.debug(f"Ephemeral: Connection established")
+            
+            # Wait for the prompt before sending the command (if configured)
+            if self._wait_for_prompt:
+                try:
+                    await asyncio.wait_for(prompt_received.wait(), timeout=3.0)
+                    self._logger.debug(f"Ephemeral: Prompt confirmed, proceeding to send")
+                except asyncio.TimeoutError:
+                    self._logger.warning(
+                        f"Ephemeral: Timeout waiting for prompt. "
+                        f"Received {len(response_data['messages'])} messages: {response_data['messages']}"
+                    )
+            
+            # Send the command
+            self._logger.debug(f"Ephemeral: Writing to transport: {message.encode()}")
             transport.write(message.encode())
-            self._last_send_time = time.time()
+            response_data["command_sent"] = True
+            self._logger.debug(f"Ephemeral: Data written to transport")
+            
+            # Give a tiny delay to ensure write buffer is flushed before we start monitoring
+            await asyncio.sleep(0.01)
+            
+            # Monitor for responses after sending command - exit early when received
+            monitor_time = 2.0
+            self._logger.debug(f"Ephemeral: Monitoring connection for up to {monitor_time}s for response")
+            start_time = time.time()
+            
+            try:
+                await asyncio.wait_for(response_received.wait(), timeout=monitor_time)
+                elapsed = time.time() - start_time
+                self._logger.debug(f"Ephemeral: Response received after {elapsed:.2f}s")
+            except asyncio.TimeoutError:
+                elapsed = time.time() - start_time
+                self._logger.warning(f"Ephemeral: No response received after sending command (waited {elapsed:.2f}s)")
+            
+            # Log all messages received after sending
+            messages_after_send = response_data['messages'][1:] if len(response_data['messages']) > 1 else []
+            if messages_after_send:
+                self._logger.debug(
+                    f"Ephemeral: Received {len(messages_after_send)} message(s) after sending: {messages_after_send}"
+                )
+            
+            self._logger.debug(f"Ephemeral: Closing connection after {elapsed:.2f}s")
             transport.close()
+            self._logger.debug(f"Ephemeral: Connection closed")
+            
         except Exception as e:
-            self._logger.error(f"Error in ephemeral connection: {e}")
+            self._logger.error(f"Ephemeral: Error in ephemeral connection: {e}")
 
     def _data_send_persistent(self, message):
-        self._logger.debug(f"data_send client: {message.encode()}")
-        self._transport.write(message.encode())
-        self._last_send_time = time.time()
+        """Queue a command to be sent via the persistent connection."""
+        try:
+            self._command_queue.put_nowait((message, True, None))
+        except asyncio.QueueFull:
+            self._logger.error("Command queue is full, dropping command")
 
     # noinspection DuplicatedCode
     def _process_received_packet(self, message):
@@ -303,11 +467,21 @@ class MatrixProtocol(asyncio.Protocol):
         self._logger.info(
             f"Sending Output source change message - Output: {output_id} changed to input: {input_id}"
         )
-        self._data_send(f"out{output_id:02d}fr{input_id:02d}\r")
+        # Create validator for this specific command
+        def validate_response(message: str) -> bool:
+            # Expect: [SUCCESS]Set output 05 connect from input 03.
+            pattern = re.compile(rf".*SUCCESS.*output\s*{output_id:02d}\s.*from input\s*{input_id:02d}.*", re.IGNORECASE)
+            return pattern.match(message) is not None
+        
+        self._data_send(f"out{output_id:02d}fr{input_id:02d}\r", validate_response)
 
     def send_status_message(self):
         self._logger.info(f"Sending status change message")
-        self._data_send("STATUS\r")
+        # Create validator for status command - expects the Power header line
+        def validate_response(message: str) -> bool:
+            return FIRST_LINE.match(message) is not None
+        
+        self._data_send("STATUS\r", validate_response)
 
     def get_status_of_output(self, output_id: int) -> Optional[int]:
         return self._output_to_input_map.get(output_id, None)
@@ -323,10 +497,20 @@ class MatrixProtocol(asyncio.Protocol):
         return self._matrix_on
 
     def send_turn_on_message(self):
-        self._data_send(f"PON\r")
+        # Create validator for power on command
+        def validate_response(message: str) -> bool:
+            # Expect: [SUCCESS]Set system power ON
+            return re.match(r".*SUCCESS.*power\s*ON.*", message, re.IGNORECASE) is not None
+        
+        self._data_send(f"PON\r", validate_response)
 
     def send_turn_off_message(self):
-        self._data_send(f"POFF\r")
+        # Create validator for power off command
+        def validate_response(message: str) -> bool:
+            # Expect: [SUCCESS]Set system power OFF
+            return re.match(r".*SUCCESS.*power\s*OFF.*", message, re.IGNORECASE) is not None
+        
+        self._data_send(f"POFF\r", validate_response)
 
     def send_guest_command(self, guest_is_input, guest_id, command):
         prefix = "IN" if guest_is_input else "OUT"
