@@ -82,6 +82,15 @@ class Matrix:
         """Send CEC mute toggle command to an output."""
         self._protocol.send_cec_mute(output_id)
 
+    def send_cec_input_select(self, output_id: int, hdmi_input: int):
+        """Send CEC input selection command to an output.
+        
+        Args:
+            output_id: Matrix output (1-8)
+            hdmi_input: TV's HDMI input (1-4)
+        """
+        self._protocol.send_cec_input_select(output_id, hdmi_input)
+
     def register_listener(self, listener):
         self._multiplex_callback.register_listener(listener)
 

@@ -544,3 +544,13 @@ class MatrixProtocol(asyncio.Protocol):
         """Send CEC mute toggle command to output."""
         self._logger.info(f"Sending CEC mute toggle to output {output_id}")
         self._data_send(f"OUT{output_id:02d} CEC MUTE\r")
+
+    def send_cec_input_select(self, output_id: int, hdmi_input: int):
+        """Send CEC input selection command to output.
+        
+        Args:
+            output_id: Matrix output (1-8)
+            hdmi_input: TV's HDMI input (1-4)
+        """
+        self._logger.info(f"Sending CEC input select to output {output_id}, HDMI input {hdmi_input}")
+        self._data_send(f"OUT{output_id:02d} CEC INPUT{hdmi_input:02d}\r")
