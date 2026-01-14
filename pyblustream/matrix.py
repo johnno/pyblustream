@@ -62,6 +62,26 @@ class Matrix:
     def is_on(self) -> bool:
         return self._protocol.is_matrix_on
 
+    def send_cec_power_on(self, output_id: int):
+        """Send CEC power on command to an output."""
+        self._protocol.send_cec_power_on(output_id)
+
+    def send_cec_power_off(self, output_id: int):
+        """Send CEC power off command to an output."""
+        self._protocol.send_cec_power_off(output_id)
+
+    def send_cec_volume_up(self, output_id: int):
+        """Send CEC volume up command to an output."""
+        self._protocol.send_cec_volume_up(output_id)
+
+    def send_cec_volume_down(self, output_id: int):
+        """Send CEC volume down command to an output."""
+        self._protocol.send_cec_volume_down(output_id)
+
+    def send_cec_mute(self, output_id: int):
+        """Send CEC mute toggle command to an output."""
+        self._protocol.send_cec_mute(output_id)
+
     def register_listener(self, listener):
         self._multiplex_callback.register_listener(listener)
 

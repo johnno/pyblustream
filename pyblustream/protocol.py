@@ -519,3 +519,28 @@ class MatrixProtocol(asyncio.Protocol):
         rn = "\r\n"
         full_command = open_command + rn + command + rn + close_command + rn
         self._data_send(full_command)
+
+    def send_cec_power_on(self, output_id: int):
+        """Send CEC power on command to output."""
+        self._logger.info(f"Sending CEC power on to output {output_id}")
+        self._data_send(f"OUT{output_id:02d} CEC PON\r")
+
+    def send_cec_power_off(self, output_id: int):
+        """Send CEC power off command to output."""
+        self._logger.info(f"Sending CEC power off to output {output_id}")
+        self._data_send(f"OUT{output_id:02d} CEC POFF\r")
+
+    def send_cec_volume_up(self, output_id: int):
+        """Send CEC volume up command to output."""
+        self._logger.info(f"Sending CEC volume up to output {output_id}")
+        self._data_send(f"OUT{output_id:02d} CEC VOLUP\r")
+
+    def send_cec_volume_down(self, output_id: int):
+        """Send CEC volume down command to output."""
+        self._logger.info(f"Sending CEC volume down to output {output_id}")
+        self._data_send(f"OUT{output_id:02d} CEC VOLDOWN\r")
+
+    def send_cec_mute(self, output_id: int):
+        """Send CEC mute toggle command to output."""
+        self._logger.info(f"Sending CEC mute toggle to output {output_id}")
+        self._data_send(f"OUT{output_id:02d} CEC MUTE\r")
