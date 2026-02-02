@@ -2,8 +2,8 @@ from setuptools import setup
 
 version = '0.21'
 
-with open("README.md", "rb") as f:
-    long_descr = f.read().decode("utf-8")
+with open("README.md", "r", encoding="utf-8") as f:
+    long_descr = f.read()
 
 setup(
     name='pyblustream',
